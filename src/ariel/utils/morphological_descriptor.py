@@ -182,9 +182,32 @@ class MorphologicalMeasures:  # noqa: PLR0904
 
         return grid, positions[core_node] - min_pos
 
+    _OPPOSITE_FACE_LABEL = {"FRONT": "BACK", "BACK": "FRONT"}
+
     def _calculate_graph_positions(
-        self, node: Any, positions: dict, pos: np.ndarray,
+        self, node: Any, positions: dict, pos: np.ndarray, x_inverted: bool = False,
     ) -> None:
+        """`face_directions` is a fixed GLOBAL step (FRONT always +1 on the
+        same axis, everywhere), not relative to how `node` itself was
+        reached. That's fine for every face except BACK, whose delta is the
+        exact negation of FRONT's: a node reached via BACK and then walked
+        via its own FRONT successor edge would retrace the fixed +1 step
+        straight back onto its parent's cell instead of continuing outward
+        -- silently colliding two distinct modules onto the same grid cell
+        (the LATER of the two in robot_graph.nodes() iteration order then
+        overwrites the earlier one in _graph_to_grid's `grid[...] = node`
+        assignment; this can even overwrite the core itself). `x_inverted`
+        mirrors the SAME fix the decoder that builds these graphs already
+        applies for exactly this reason (see cppn_best_first.py's
+        MorphologyDecoderBestFirst._get_child_coords): True for a node whose
+        path from the core has an odd number of BACK edges, which swaps
+        which global step its own FRONT/BACK successor edges resolve to, so
+        "continue via my own FRONT" means "keep moving away from where I
+        came from" instead of "walk back into my parent." Without this,
+        symmetry/position-based measures on any body with a BACK-then-FRONT
+        (or generally x-inverted) branch -- an ordinary, common growth
+        pattern, not a rare edge case -- silently work from wrong,
+        overlapping position data."""
         positions[node] = pos.copy()
         face_directions = {
             "FRONT":  np.array([1, 0, 0]),
@@ -197,9 +220,12 @@ class MorphologicalMeasures:  # noqa: PLR0904
         for child in self.graph.successors(node):
             data = self.graph.get_edge_data(node, child)
             if data and "face" in data and data["face"] in face_directions:
-                child_pos = pos + face_directions[data["face"]]
+                face = data["face"]
+                effective_face = self._OPPOSITE_FACE_LABEL.get(face, face) if x_inverted else face
+                child_pos = pos + face_directions[effective_face]
+                child_x_inverted = x_inverted != (face == "BACK")
                 if child not in positions:
-                    self._calculate_graph_positions(child, positions, child_pos)
+                    self._calculate_graph_positions(child, positions, child_pos, child_x_inverted)
 
     def _calculate_core_is_filled(self) -> bool:
         return len(self._get_node_connections(self.core_node)) == len(
@@ -243,58 +269,120 @@ class MorphologicalMeasures:  # noqa: PLR0904
         self.symmetry_grid[:x, :y, :z] = self.grid
 
     def _calculate_xy_symmetry(self) -> float:
+        """Mirror across the core's XY plane (offset along Z).
+
+        Two bugs fixed here vs. the original: (1) the offset range was
+        `range(1, (dim-1)//2)`, which EXCLUDES the outermost mirror pair --
+        for a symmetry_grid extent of 3 this range is empty, so a body only
+        3 cells deep along this axis (extremely common at these module
+        counts) got 0 pairs checked at all, reporting 0.0 regardless of
+        whether it was actually symmetric. Fixed to `range(1, (dim-1)//2 + 1)`
+        so the boundary offset is included. (2) `on_plane` was incremented
+        inside the offset loop, so a cell on the mirror plane itself got
+        counted once per offset value instead of once total, inflating
+        `on_plane` (and shrinking `diff`) for any body wider than the
+        smallest possible extent. Counted in its own pass here instead.
+        Bounds-checked (`cz +/- z`) since the offset now reaches the grid's
+        edge exactly, where the padding in _pad_grid isn't guaranteed
+        symmetric on both sides of an off-centre core."""
         on_plane = off_sym = 0
         cz = self.core_grid_position[2]
+        height_sym = self.symmetry_grid.shape[2]
+        for x, y in product(range(self.bounding_box_depth), range(self.bounding_box_width)):
+            if self.symmetry_grid[x, y, cz] is not None:
+                on_plane += 1
+        z_max = (self.bounding_box_height - 1) // 2 + 1
         for x, y, z in product(
             range(self.bounding_box_depth),
             range(self.bounding_box_width),
-            range(1, (self.bounding_box_height - 1) // 2),
+            range(1, z_max),
         ):
-            if self.symmetry_grid[x, y, cz] is not None:
-                on_plane += 1
+            if cz - z < 0 or cz + z >= height_sym:
+                continue
             pos = self.symmetry_grid[x, y, cz + z]
             neg = self.symmetry_grid[x, y, cz - z]
             if pos is not None and neg is not None:
                 if self._get_node_type(pos) == self._get_node_type(neg):
                     off_sym += 2
+        # diff==0 means EVERY module sits exactly on this mirror plane (e.g.
+        # a body that never used RIGHT/LEFT at all, for xz_symmetry) -- there
+        # is no off-plane structure to BE asymmetric, so this is the
+        # degenerate limit of "symmetric" (1.0), not "no asymmetry found
+        # because there's nothing to check" (0.0, which reads as "totally
+        # asymmetric" and is indistinguishable from a genuine failure to
+        # mirror anything -- confirmed against a real run: every
+        # low-scoring body under the old 0.0 fallback turned out to never
+        # use RIGHT/LEFT at all, not to have an unmirrored RIGHT/LEFT pair).
         diff = self.num_modules - on_plane
-        return off_sym / diff if diff > 0 else 0.0
+        return off_sym / diff if diff > 0 else 1.0
 
     def _calculate_xz_symmetry(self) -> float:
+        """Mirror across the core's XZ plane (offset along Y) -- see
+        _calculate_xy_symmetry's docstring for the two bugs fixed here."""
         on_plane = off_sym = 0
         cy = self.core_grid_position[1]
-        for x, y, z in product(
-            range(self.bounding_box_depth),
-            range(1, (self.bounding_box_width - 1) // 2),
-            range(self.bounding_box_height),
-        ):
+        width_sym = self.symmetry_grid.shape[1]
+        for x, z in product(range(self.bounding_box_depth), range(self.bounding_box_height)):
             if self.symmetry_grid[x, cy, z] is not None:
                 on_plane += 1
+        y_max = (self.bounding_box_width - 1) // 2 + 1
+        for x, y, z in product(
+            range(self.bounding_box_depth),
+            range(1, y_max),
+            range(self.bounding_box_height),
+        ):
+            if cy - y < 0 or cy + y >= width_sym:
+                continue
             pos = self.symmetry_grid[x, cy + y, z]
             neg = self.symmetry_grid[x, cy - y, z]
             if pos is not None and neg is not None:
                 if self._get_node_type(pos) == self._get_node_type(neg):
                     off_sym += 2
+        # diff==0 means EVERY module sits exactly on this mirror plane (e.g.
+        # a body that never used RIGHT/LEFT at all, for xz_symmetry) -- there
+        # is no off-plane structure to BE asymmetric, so this is the
+        # degenerate limit of "symmetric" (1.0), not "no asymmetry found
+        # because there's nothing to check" (0.0, which reads as "totally
+        # asymmetric" and is indistinguishable from a genuine failure to
+        # mirror anything -- confirmed against a real run: every
+        # low-scoring body under the old 0.0 fallback turned out to never
+        # use RIGHT/LEFT at all, not to have an unmirrored RIGHT/LEFT pair).
         diff = self.num_modules - on_plane
-        return off_sym / diff if diff > 0 else 0.0
+        return off_sym / diff if diff > 0 else 1.0
 
     def _calculate_yz_symmetry(self) -> float:
+        """Mirror across the core's YZ plane (offset along X) -- see
+        _calculate_xy_symmetry's docstring for the two bugs fixed here."""
         on_plane = off_sym = 0
         cx = self.core_grid_position[0]
+        depth_sym = self.symmetry_grid.shape[0]
+        for y, z in product(range(self.bounding_box_width), range(self.bounding_box_height)):
+            if self.symmetry_grid[cx, y, z] is not None:
+                on_plane += 1
+        x_max = (self.bounding_box_depth - 1) // 2 + 1
         for x, y, z in product(
-            range(1, (self.bounding_box_depth - 1) // 2),
+            range(1, x_max),
             range(self.bounding_box_width),
             range(self.bounding_box_height),
         ):
-            if self.symmetry_grid[cx, y, z] is not None:
-                on_plane += 1
+            if cx - x < 0 or cx + x >= depth_sym:
+                continue
             pos = self.symmetry_grid[cx + x, y, z]
             neg = self.symmetry_grid[cx - x, y, z]
             if pos is not None and neg is not None:
                 if self._get_node_type(pos) == self._get_node_type(neg):
                     off_sym += 2
+        # diff==0 means EVERY module sits exactly on this mirror plane (e.g.
+        # a body that never used RIGHT/LEFT at all, for xz_symmetry) -- there
+        # is no off-plane structure to BE asymmetric, so this is the
+        # degenerate limit of "symmetric" (1.0), not "no asymmetry found
+        # because there's nothing to check" (0.0, which reads as "totally
+        # asymmetric" and is indistinguishable from a genuine failure to
+        # mirror anything -- confirmed against a real run: every
+        # low-scoring body under the old 0.0 fallback turned out to never
+        # use RIGHT/LEFT at all, not to have an unmirrored RIGHT/LEFT pair).
         diff = self.num_modules - on_plane
-        return off_sym / diff if diff > 0 else 0.0
+        return off_sym / diff if diff > 0 else 1.0
 
     # ------------------------------------------------------------------
     # Bounding-box geometry
